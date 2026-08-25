@@ -1,0 +1,379 @@
+1Q. Optimized Linux File System Layout for a 50 GB Server
+
+The main objectives are to separate frequently growing data, prevent logs from consuming the entire disk, and ensure critical services continue running even when one area becomes full.
+
+Proposed partition layout
+Partition                  	Size	        Purpose
+/boot	                      1 GB	        Kernel and boot files
+/	                          10 GB	        Operating system and applications
+/var	                      8 GB        	Variable data and package/service files
+/var/log	                  10 GB	        System and application logs
+/home	                      10 GB	        User files
+/tmp	                      3 GB	        Temporary files
+Swap	                      4 GB	        Virtual memory
+Free/LVM space	            4 GB        	Future expansion
+Total = 50 GB
+
+A separate /var/log is particularly important. If logs fill their partition, the root filesystem and critical system files remain protected.
+
+Storage management
+
+Using LVM (Logical Volume Manager) is preferable because logical volumes can be resized more easily than fixed partitions.
+
+For example:
+
+pvcreate /dev/sdb
+vgcreate vgserver /dev/sdb
+lvcreate -L 10G -n lv_log vgserver
+mkfs.ext4 /dev/vgserver/lv_log
+
+Mount it as /var/log through /etc/fstab.
+
+Log rotation
+
+logrotate should be configured to keep logs below 10 GB.
+
+Example:
+
+/var/log/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    size 500M
+}
+
+This rotates logs daily and also rotates them when they reach the specified size. Old logs are compressed to save space.
+
+Check the configuration using:
+
+logrotate -d /etc/logrotate.conf
+Monitoring disk usage
+df -h
+du -sh /var/log/*
+
+Automated monitoring can trigger alerts when usage reaches, for example, 80–85%.
+
+Ensuring service continuity
+
+Critical services should not depend on a filesystem that can be filled by logs. Separate /var/log protects /, while log rotation and compression prevent uncontrolled growth.
+
+Conclusion: A combination of separate filesystems + LVM + logrotate + disk monitoring provides efficient storage utilization, keeps logs below the 10 GB limit, and prevents disk exhaustion from interrupting critical services.
+
+2Q. Kernel-Level Optimization for High CPU Workloads
+
+Frequent context switching causes CPU time to be wasted saving and restoring process state instead of performing useful work. Since hardware cannot be upgraded, kernel and scheduler tuning should be used.
+
+1. Analyze context switching
+
+Commands such as:
+
+vmstat 1
+
+and:
+
+pidstat -w 1
+
+can identify excessive context switching.
+
+vmstat reports system-wide context switches, while pidstat can identify processes producing large numbers of switches.
+
+2. CPU affinity
+
+A process can be restricted to selected CPUs:
+
+taskset -cp 2,3 <PID>
+
+This reduces unnecessary migration of processes between CPUs and can improve cache locality.
+
+3. Scheduler priority
+
+Normal processes can be given lower or higher scheduling priority:
+
+nice -n 10 ./application
+
+or:
+
+renice -n 5 -p <PID>
+
+For real-time workloads, Linux provides real-time scheduling policies such as SCHED_FIFO and SCHED_RR.
+
+For example:
+
+chrt -f 50 ./realtime_app
+
+However, real-time priorities must be used carefully because a CPU-intensive real-time process can starve ordinary system processes.
+
+4. Kernel preemption
+
+A kernel configured with an appropriate preemption model can reduce scheduling latency. For real-time workloads, a PREEMPT_RT kernel can provide significantly more deterministic scheduling behavior.
+
+5. Kernel modules
+
+Unnecessary kernel modules and drivers can be disabled where appropriate to reduce unnecessary kernel activity.
+
+Check loaded modules:
+
+lsmod
+
+A module can be removed when it is not required:
+
+sudo modprobe -r module_name
+
+Only unused modules should be removed because removing a required driver can disrupt hardware or services.
+
+6. Interrupt optimization
+
+High interrupt rates can also contribute to CPU overhead. Tools such as:
+
+cat /proc/interrupts
+
+help identify interrupt-heavy devices.
+
+irqbalance can distribute hardware interrupts across CPUs where appropriate.
+
+7. Measure after every change
+
+Performance should be measured before and after tuning using:
+
+top
+vmstat 1
+pidstat -w 1
+mpstat -P ALL 1
+
+Conclusion: The best approach is to combine CPU affinity, scheduler priorities, appropriate preemption configuration, interrupt balancing, and removal of unnecessary modules. Changes should be measured carefully because aggressive real-time scheduling can reduce overall system responsiveness.
+
+3Q. Processing 1 Million Log Entries per Day Using Shell Scripting
+
+Processing one million lines within two minutes requires avoiding inefficient commands and unnecessary process creation.
+
+The main principle is to process the file in a single streaming pass rather than repeatedly using grep, cut, sed, and sort.
+
+Efficient approach using awk
+
+Suppose the log file is:
+
+2026-08-25 10:00:01 ERROR user123 ...
+2026-08-25 10:00:02 INFO user456 ...
+
+A single awk process can filter and count entries:
+
+awk '
+/ERROR/ { error++ }
+/WARN/  { warn++ }
+/INFO/  { info++ }
+END {
+    print "ERROR:", error
+    print "WARN:", warn
+    print "INFO:", info
+}' application.log
+
+This makes only one sequential pass through the file.
+
+Why awk?
+
+awk is efficient because:
+
+It processes input as a stream.
+It avoids creating a new process for every line.
+It combines filtering, field extraction and calculations.
+It performs well on large text files.
+Avoid inefficient commands
+
+An inefficient design might be:
+
+grep ERROR log | cut ... | sort | uniq ...
+
+repeated many times.
+
+Each command creates additional processing stages and requires additional scans of the data.
+
+Instead, combine operations:
+
+awk -F' ' '$3 == "ERROR" { count++ } END { print count }' log
+Parallel processing
+
+If the file is extremely large and the workload can safely be divided, it can be split into chunks:
+
+split -n l/4 application.log chunk_
+
+The chunks can then be processed in parallel:
+
+for f in chunk_*; do
+    awk '/ERROR/ {e++} END {print e+0}' "$f" &
+done
+wait
+
+However, parallelism should only be used when the available CPU resources justify it. Excessive parallel processes can actually make performance worse.
+
+Additional optimizations
+
+Use:
+
+LC_ALL=C
+
+for byte-oriented processing where appropriate, because locale processing can add overhead.
+
+For compressed logs, process them directly where possible:
+
+zcat application.log.gz | awk '/ERROR/ {count++} END {print count}'
+Performance measurement
+time ./process_logs.sh
+
+For one million entries, the goal is to keep the implementation to a small number of sequential passes and avoid unnecessary external commands.
+
+Conclusion: A streaming awk-based single-pass solution is the preferred shell approach. It minimizes process creation, disk I/O, and repeated scanning, making completion within the two-minute target much more achievable.
+
+4Q. Managing a Faulty Process Consuming 90% CPU
+
+The system should not be restarted because critical services must remain available. The process should therefore be identified, monitored, and controlled carefully.
+
+Step 1: Identify the process
+
+Use:
+
+top
+
+or:
+
+ps aux --sort=-%cpu | head
+
+These commands identify processes consuming the most CPU.
+
+Suppose the faulty process has PID 2450.
+
+Step 2: Investigate the process
+ps -p 2450 -o pid,ppid,user,%cpu,%mem,stat,cmd
+
+Check:
+
+PID
+Parent PID
+Owner
+CPU usage
+Memory usage
+Process state
+Command
+
+Also inspect open files:
+
+lsof -p 2450
+Step 3: Monitor continuously
+top -p 2450
+
+or:
+
+pidstat -p 2450 1
+
+This determines whether CPU consumption is continuously high or only temporary.
+
+Step 4: Reduce its priority
+
+If the process must remain alive but should receive fewer CPU resources:
+
+renice +10 -p 2450
+
+This allows other important processes to receive more CPU time.
+
+Step 5: Restrict CPU usage
+
+If appropriate, use CPU affinity:
+
+taskset -cp 0 2450
+
+This restricts the process to CPU 0.
+
+Another option is systemd resource control for services, using controls such as CPU quotas.
+
+Step 6: Stop gracefully if necessary
+
+First send a normal termination signal:
+
+kill -TERM 2450
+
+Wait and verify:
+
+ps -p 2450
+
+Only if the process does not respond should a forced kill be considered:
+
+kill -KILL 2450
+
+SIGKILL should be a last resort because the process cannot clean up resources.
+
+Step 7: Check critical services
+
+After intervention:
+
+systemctl --failed
+systemctl status critical-service
+
+Monitor CPU and system load using:
+
+uptime
+vmstat 1
+
+Conclusion: The safest strategy is identify → monitor → lower priority or constrain CPU → gracefully terminate if necessary → verify critical services. This solves the CPU problem without rebooting the server or unnecessarily affecting critical services.
+
+5Q. RAM Allocation for 5 VMs on a 16 GB Host
+Given
+Total physical RAM = 16 GB
+Number of VMs = 5
+Minimum RAM per VM = 2 GB
+Host OS requirement = 4 GB
+
+Minimum required memory:
+
+5×2+4=14 GB
+
+Therefore:
+
+16−14=2 GB
+
+Only 2 GB remains available after satisfying the minimum requirements.
+
+Proposed allocation
+Resource	RAM
+Host OS	4 GB
+VM1	2.4 GB
+VM2	2.4 GB
+VM3	2.4 GB
+VM4	2.4 GB
+VM5	2.4 GB
+Total	16 GB
+
+This gives every VM more than its required 2 GB while keeping the host at its required 4 GB.
+
+However, allocating all 16 GB leaves no safety margin for host-level bursts, virtualization overhead, or cache requirements. Therefore, in a real deployment, the exact VM allocations should be adjusted according to actual workload.
+
+Ballooning
+
+Memory ballooning allows a hypervisor to reclaim unused memory from VMs and give it to other VMs when necessary.
+
+For example, if VM1 is using only 1 GB actively while VM2 needs additional memory, unused memory can potentially be reclaimed from VM1.
+
+Memory overcommit
+
+The hypervisor can use controlled memory overcommit, but this should be used carefully. Overcommitting memory too aggressively can cause swapping and significantly reduce performance.
+
+Swap
+
+The host can maintain a small swap area as an emergency mechanism, but swap should not be treated as a replacement for RAM. Heavy swapping can severely reduce VM performance.
+
+Prioritization
+
+If some VMs run more important applications, they should receive higher resource priority. Less important VMs can have lower memory/CPU shares.
+
+Recommended strategy
+
+A practical allocation would be:
+
+Host OS: 4 GB
+Each VM: 2 GB minimum
+Remaining 2 GB: used through dynamic allocation/ballooning, workload-based allocation, and controlled overhead management.
+
+If all five VMs genuinely require more than 2 GB simultaneously, the 16 GB physical limit becomes the bottleneck; virtualization cannot create additional physical RAM.
+
+Conclusion: The mathematical minimum is 14 GB, leaving only 2 GB of flexibility. Dynamic memory/ballooning and workload prioritization can improve utilization, but sustained workloads requiring more memory than the physical server provides will require additional RAM or moving some VMs to another host.
